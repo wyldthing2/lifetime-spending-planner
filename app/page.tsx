@@ -231,7 +231,10 @@ export default function Home() {
 
   useEffect(() => {
     if (!firebaseEnabled || !firebaseReady || !firebaseUser || !hydrated || !firebaseRef.current) return;
-    if (revision === skipRemoteRevision.current) return;
+    if (revision === skipRemoteRevision.current) {
+      skipRemoteRevision.current = -1;
+      return;
+    }
     const timer = window.setTimeout(() => {
       const { db } = firebaseRef.current!;
       const snapshotRef = doc(db, "workspaces", "household");
@@ -316,7 +319,7 @@ export default function Home() {
       setSavedViews(result.snapshot.savedViews);
       setScenario(result.snapshot.scenario);
       setYearRange(result.snapshot.yearRange);
-      setRevision(0);
+      skipRemoteRevision.current = -1;
       setHydrated(true);
       setSaveState("Imported " + result.matched + " categories from " + result.sheetName);
     } catch {
