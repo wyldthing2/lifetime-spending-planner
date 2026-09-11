@@ -2,7 +2,38 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /workspaces/household {
-      allow read, write: if request.auth != null;
+    function signedIn() { return request.auth != null; }
+    function isMember(workspaceId) { return signedIn() && exists(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)); }
+    function canEdit(workspaceId) { return isMember(workspaceId) && get(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)).data.role in ['owner', 'editor']; }
+
+    match /users/{userId} {
+      allow read, write: if signedIn() && request.auth.uid == userId;
+      match /workspaces/{workspaceId} {
+        allow read, write: if signedIn() && request.auth.uid == userId;
+      }
+    }
+
+    match /workspaces/{workspaceId} {
+      allow read: if isMember(workspaceId) || (signedIn() && workspaceId == request.auth.uid) || (workspaceId == 'household' && signedIn() && !resource.data.keys().hasAny(['ownerId' ]));
+      allow create: if signedIn() && request.resource.data.ownerId == request.auth.uid;
+      allow update: if canEdit(workspaceId) || (workspaceId == 'household' && signedIn() && !resource.data.keys().hasAny(['ownerId' ]) && request.resource.data.ownerId == request.auth.uid);
+      allow delete: if false;
+
+      match /members/{memberId} {
+        allow read: if isMember(workspaceId) || (signedIn() && memberId == request.auth.uid);
+        allow create: if signedIn() && memberId == request.auth.uid && (
+          (request.resource.data.role == 'owner' && get(/databases/$(database)/documents/workspaces/$(workspaceId)).data.ownerId == request.auth.uid) ||
+          (request.resource.data.role in ['editor', 'viewer'] && request.resource.data.inviteId is string && get(/databases/$(database)/documents/invites/$(request.resource.data.inviteId)).data.workspaceId == workspaceId && get(/databases/$(database)/documents/invites/$(request.resource.data.inviteId)).data.role == request.resource.data.role)
+        );
+        allow update: if signedIn() && memberId == request.auth.uid && resource.data.userId == request.auth.uid && request.resource.data.userId == request.auth.uid && request.resource.data.role == resource.data.role;
+        allow delete: if false;
+      }
+    }
+
+    match /invites/{inviteId} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.createdBy == request.auth.uid && request.resource.data.workspaceId is string && request.resource.data.role in ['editor', 'viewer'] && canEdit(request.resource.data.workspaceId);
+      allow update, delete: if false;
     }
   }
+}

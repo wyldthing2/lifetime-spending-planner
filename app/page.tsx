@@ -8,7 +8,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ChangeEvent, FormEvent } from "react";
 import { onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, type User } from "firebase/auth";
-import { doc, onSnapshot, runTransaction, serverTimestamp } from "firebase/firestore";
+import { addDoc, collection, doc, getDoc, getDocs, onSnapshot, runTransaction, serverTimestamp, setDoc } from "firebase/firestore";
 import { firebaseConfigured, getFirebaseServices } from "@/lib/firebase";
 import { createBlankWorkbook, importLifetimeWorkbook } from "@/lib/workbook-import";
 import { Category, Scenario, initialSnapshot } from "@/lib/planner-data";
@@ -112,6 +112,12 @@ export default function Home() {
   const [hydrated, setHydrated] = useState(false);
   const [revision, setRevision] = useState(0);
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
+  const [workspaceId, setWorkspaceId] = useState('');
+  const [workspaceLinks, setWorkspaceLinks] = useState<Array<{ id: string; name: string; role: string }>>([]);
+  const [workspaceReady, setWorkspaceReady] = useState(false);
+  const [canEdit, setCanEdit] = useState(true);
+  const [inviteRole, setInviteRole] = useState<'editor' | 'viewer'>('editor');
+  const [inviteMessage, setInviteMessage] = useState('');
   const [firebaseReady, setFirebaseReady] = useState(false);
   const [authMode, setAuthMode] = useState<"signIn" | "register">("signIn");
   const [authEmail, setAuthEmail] = useState("");
@@ -140,6 +146,87 @@ export default function Home() {
       setFirebaseReady(true);
     });
   }, [firebaseEnabled]);
+
+  useEffect(() => {
+    if (!firebaseEnabled || !firebaseReady || !firebaseUser || !firebaseRef.current) return;
+    let cancelled = false;
+    const bootstrap = async () => {
+      const { db } = firebaseRef.current!;
+      const userId = firebaseUser.uid;
+      const profileRef = doc(db, "users", userId);
+      try {
+        let profile: Awaited<ReturnType<typeof getDoc>> | null = null;
+        try { profile = await getDoc(profileRef); } catch { profile = null; }
+        const profileData = profile?.exists() ? profile.data() as { currentWorkspaceId?: unknown } : null;
+        let activeId = typeof profileData?.currentWorkspaceId === "string" ? profileData.currentWorkspaceId : "";
+        if (!activeId) {
+          const legacyRef = doc(db, "workspaces", "household");
+          let legacy: Awaited<ReturnType<typeof getDoc>> | null = null;
+          try { legacy = await getDoc(legacyRef); } catch { legacy = null; }
+          if (legacy?.exists() && !(legacy.data() as { ownerId?: unknown }).ownerId) {
+            try {
+              await runTransaction(db, async (transaction) => {
+                const current = await transaction.get(legacyRef);
+                if (current.exists() && !current.data().ownerId) transaction.update(legacyRef, { ownerId: userId, name: "My budget" });
+              });
+              activeId = "household";
+            } catch { /* a different account may have claimed the old workspace */ }
+          }
+          if (!activeId) {
+            activeId = userId;
+            const personalRef = doc(db, "workspaces", activeId);
+            const personal = await getDoc(personalRef);
+            if (!personal.exists()) await setDoc(personalRef, { version: 1, data: initialSnapshot, ownerId: userId, name: "My budget", updatedBy: userId, updatedAt: serverTimestamp() });
+          }
+          await setDoc(doc(db, "workspaces", activeId, "members", userId), { userId, email: firebaseUser.email ?? "", role: "owner", joinedAt: serverTimestamp() }, { merge: true });
+          const workspace = await getDoc(doc(db, "workspaces", activeId));
+          const workspaceName = typeof workspace.data()?.name === "string" ? workspace.data()?.name as string : "My budget";
+          await setDoc(profileRef, { currentWorkspaceId: activeId }, { merge: true });
+          await setDoc(doc(db, "users", userId, "workspaces", activeId), { workspaceId: activeId, name: workspaceName, role: "owner" }, { merge: true });
+        }
+        const pendingInvite = new URLSearchParams(window.location.search).get("invite");
+        if (pendingInvite) {
+          const inviteSnap = await getDoc(doc(db, "invites", pendingInvite));
+          const invite = inviteSnap.exists() ? inviteSnap.data() : null;
+          const targetId = invite && typeof invite.workspaceId === "string" ? invite.workspaceId : "";
+          const targetRole = invite && (invite.role === "viewer" || invite.role === "editor") ? invite.role : "";
+          if (targetId && targetRole) {
+            const memberRef = doc(db, "workspaces", targetId, "members", userId);
+            const member = await getDoc(memberRef);
+            if (!member.exists()) await setDoc(memberRef, { userId, email: firebaseUser.email ?? "", role: targetRole, inviteId: pendingInvite, joinedAt: serverTimestamp() });
+            const targetName = invite && typeof invite.workspaceName === "string" ? invite.workspaceName as string : "Shared budget";
+            await setDoc(doc(db, "users", userId, "workspaces", targetId), { workspaceId: targetId, name: targetName, role: targetRole }, { merge: true });
+            await setDoc(profileRef, { currentWorkspaceId: targetId }, { merge: true });
+            activeId = targetId;
+            setSaveState("Joined " + targetName);
+          }
+          window.history.replaceState({}, "", window.location.pathname + window.location.hash);
+        }
+        const linksSnapshot = await getDocs(collection(db, "users", userId, "workspaces"));
+        const links = linksSnapshot.docs.map((item) => {
+          const data = item.data();
+          return { id: item.id, name: typeof data.name === "string" ? data.name : "Budget", role: typeof data.role === "string" ? data.role : "viewer" };
+        });
+        const activeWorkspace = await getDoc(doc(db, "workspaces", activeId));
+        const activeMember = await getDoc(doc(db, "workspaces", activeId, "members", userId));
+        const activeRole = activeMember.exists() && typeof activeMember.data().role === "string" ? activeMember.data().role as string : activeWorkspace.data()?.ownerId === userId ? "owner" : "viewer";
+        if (!links.some((item) => item.id === activeId)) links.push({ id: activeId, name: typeof activeWorkspace.data()?.name === "string" ? activeWorkspace.data()?.name as string : "Budget", role: activeRole });
+        if (!cancelled) {
+          skipRemoteRevision.current = -1;
+          setWorkspaceLinks(links);
+          setWorkspaceId(activeId);
+          setCanEdit(activeRole === "owner" || activeRole === "editor");
+          setWorkspaceReady(true);
+          setHydrated(false);
+          setSaveState((current) => current.startsWith("Joined ") ? current : "Loading " + (links.find((item) => item.id === activeId)?.name ?? "budget") + "…");
+        }
+      } catch {
+        if (!cancelled) setSaveState("Could not prepare your budget");
+      }
+    };
+    void bootstrap();
+    return () => { cancelled = true; };
+  }, [firebaseEnabled, firebaseReady, firebaseUser]);
 
   useEffect(() => {
     if (firebaseEnabled) return;
@@ -200,17 +287,12 @@ export default function Home() {
   }, [categories, selectedIds, savedViews, scenario, yearRange, hydrated, revision, firebaseEnabled]);
 
   useEffect(() => {
-    if (!firebaseEnabled || !firebaseReady || !firebaseUser || !firebaseRef.current) return;
+    if (!firebaseEnabled || !firebaseReady || !firebaseUser || !workspaceReady || !workspaceId || !firebaseRef.current) return;
     const { db } = firebaseRef.current;
-    const snapshotRef = doc(db, "workspaces", "household");
+    const snapshotRef = doc(db, "workspaces", workspaceId);
     const unsubscribe = onSnapshot(snapshotRef, (snapshot) => {
       if (!snapshot.exists()) {
-        void runTransaction(db, async (transaction) => {
-          const current = await transaction.get(snapshotRef);
-          if (!current.exists()) {
-            transaction.set(snapshotRef, { version: 1, data: initialSnapshot, updatedBy: firebaseUser.uid, updatedAt: serverTimestamp() });
-          }
-        });
+        setSaveState("Budget unavailable");
         return;
       }
       const payload = snapshot.data() as { version?: unknown; data?: unknown };
@@ -227,23 +309,23 @@ export default function Home() {
       setSaveState("Synced");
     }, () => setSaveState("Firebase unavailable"));
     return unsubscribe;
-  }, [firebaseEnabled, firebaseReady, firebaseUser]);
+  }, [firebaseEnabled, firebaseReady, firebaseUser, workspaceReady, workspaceId]);
 
   useEffect(() => {
-    if (!firebaseEnabled || !firebaseReady || !firebaseUser || !hydrated || !firebaseRef.current) return;
+    if (!firebaseEnabled || !firebaseReady || !firebaseUser || !workspaceReady || !workspaceId || !hydrated || !canEdit || !firebaseRef.current) return;
     if (revision === skipRemoteRevision.current) {
       skipRemoteRevision.current = -1;
       return;
     }
     const timer = window.setTimeout(() => {
       const { db } = firebaseRef.current!;
-      const snapshotRef = doc(db, "workspaces", "household");
+      const snapshotRef = doc(db, "workspaces", workspaceId);
       void runTransaction(db, async (transaction) => {
         const current = await transaction.get(snapshotRef);
         const currentVersion = current.exists() && typeof current.data().version === "number" ? current.data().version as number : 0;
         if (currentVersion > revision) throw new Error("CONFLICT");
         const nextVersion = currentVersion + 1;
-        transaction.set(snapshotRef, { version: nextVersion, data: { categories, selectedIds, savedViews, scenario, yearRange }, updatedBy: firebaseUser.uid, updatedAt: serverTimestamp() });
+        transaction.set(snapshotRef, { version: nextVersion, data: { categories, selectedIds, savedViews, scenario, yearRange }, updatedBy: firebaseUser.uid, updatedAt: serverTimestamp() }, { merge: true });
         return nextVersion;
       }).then((nextVersion) => {
         skipRemoteRevision.current = nextVersion;
@@ -252,7 +334,7 @@ export default function Home() {
       }).catch((error: unknown) => setSaveState(error instanceof Error && error.message === "CONFLICT" ? "Changed by collaborator" : "Could not save to Firebase"));
     }, 450);
     return () => window.clearTimeout(timer);
-  }, [categories, selectedIds, savedViews, scenario, yearRange, hydrated, revision, firebaseEnabled, firebaseReady, firebaseUser]);
+  }, [categories, selectedIds, savedViews, scenario, yearRange, hydrated, revision, firebaseEnabled, firebaseReady, firebaseUser, workspaceReady, workspaceId, canEdit]);
 
   useEffect(() => {
     let sequence = "";
@@ -276,13 +358,19 @@ export default function Home() {
   const lifetimeTotal = included.reduce((sum, item) => sum + item.lifetime * factor, 0);
   const recurringTotal = included.filter((item) => item.group === "Recurring").reduce((sum, item) => sum + item.annual * factor, 0);
   const largest = [...included].sort((a, b) => b.lifetime - a.lifetime)[0];
+  const workspaceName = workspaceLinks.find((item) => item.id === workspaceId)?.name ?? "My budget";
 
   const setAnnual = (id: string, value: number) => {
+    if (!canEdit) { setSaveState("View only"); return; }
     setCategories((current) => current.map((item) => item.id === id ? { ...item, annual: value } : item));
     setSaveState("Unsaved changes");
   };
-  const toggleId = (id: string) => setSelectedIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
+  const toggleId = (id: string) => {
+    if (!canEdit) return;
+    setSelectedIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
+  };
   const saveCustomView = () => {
+    if (!canEdit) { setSaveState("View only"); return; }
     const name = viewName.trim();
     if (!name) return;
     setSavedViews((current) => [...current.filter((item) => item !== name), name]);
@@ -327,19 +415,41 @@ export default function Home() {
     }
   };
 
-  const copyInviteLink = async () => {
-    const inviteLink = window.location.href.split("#")[0];
+  const switchWorkspace = (nextId: string) => {
+    const link = workspaceLinks.find((item) => item.id === nextId);
+    if (!link || nextId === workspaceId || !firebaseRef.current || !firebaseUser) return;
+    setWorkspaceId(nextId);
+    setCanEdit(link.role === "owner" || link.role === "editor");
+    setHydrated(false);
+    setRevision(0);
+    skipRemoteRevision.current = -1;
+    setSaveState("Loading " + link.name + "…");
+    void setDoc(doc(firebaseRef.current.db, "users", firebaseUser.uid), { currentWorkspaceId: nextId }, { merge: true });
+  };
+
+  const createInviteLink = async () => {
+    if (!firebaseRef.current || !firebaseUser || !workspaceId || !canEdit) return;
+    setInviteMessage("Creating invitation…");
     try {
-      await navigator.clipboard.writeText(inviteLink);
-      setInviteCopied(true);
-      setSaveState("Invite link copied");
-      window.setTimeout(() => setInviteCopied(false), 3000);
+      const currentLink = workspaceLinks.find((item) => item.id === workspaceId);
+      const invite = await addDoc(collection(firebaseRef.current.db, "invites"), { workspaceId, workspaceName: currentLink?.name ?? "Shared budget", role: inviteRole, createdBy: firebaseUser.uid, createdAt: serverTimestamp() });
+      const inviteLink = window.location.origin + window.location.pathname + "?invite=" + encodeURIComponent(invite.id);
+      try {
+        await navigator.clipboard.writeText(inviteLink);
+        setInviteCopied(true);
+        setInviteMessage("Invite link copied. Send it to the person you want to add.");
+        window.setTimeout(() => setInviteCopied(false), 3000);
+      } catch {
+        window.prompt("Copy this invite link:", inviteLink);
+        setInviteMessage("Invite created. Send the copied link to your collaborator.");
+      }
     } catch {
-      window.prompt("Copy this invite link:", inviteLink);
+      setInviteMessage("Could not create the invite. Check your connection and try again.");
     }
   };
 
   if (firebaseEnabled && firebaseReady && !firebaseUser) return <AuthScreen mode={authMode} email={authEmail} password={authPassword} error={authError} onModeChange={setAuthMode} onEmailChange={setAuthEmail} onPasswordChange={setAuthPassword} onSubmit={submitAuth} />;
+  if (firebaseEnabled && firebaseUser && !workspaceReady) return <main className="grid min-h-screen place-items-center bg-[#f4f7f5] px-5 text-[#1c2a27]"><div className="rounded-2xl border border-[#dfe9e4] bg-white px-6 py-5 text-[13px] text-[#5e756d] shadow-sm">Preparing your private budget…</div></main>;
 
   const downloadBackup = async () => {
     const password = window.prompt("Choose a password for this encrypted backup.");
@@ -373,6 +483,7 @@ export default function Home() {
           setSavedViews(data.savedViews);
           setScenario(data.scenario);
           setYearRange(data.yearRange);
+          skipRemoteRevision.current = -1;
           setSaveState("Restored, syncing…");
         } catch {
           setSaveState("Backup could not be opened");
@@ -407,7 +518,7 @@ export default function Home() {
         <aside className="hidden w-[242px] shrink-0 flex-col bg-[#102d29] px-4 py-5 text-white lg:flex">
           <div className="mb-9 flex items-center gap-3 px-3">
             <div className="grid h-9 w-9 place-items-center rounded-xl bg-[#8fdbca] text-[#153d36]"><Sparkles size={18} /></div>
-            <div><div className="text-[14px] font-semibold tracking-tight">Lifetime planner</div><div className="text-[11px] text-[#9db2ab]">Shared household workspace</div></div>
+            <div><div className="text-[14px] font-semibold tracking-tight">Lifetime planner</div><div className="text-[11px] text-[#9db2ab]">Personal + shared budgets</div></div>
           </div>
           <div className="mb-2 px-3 text-[10px] font-semibold uppercase tracking-[0.16em] text-[#6e8c83]">Views</div>
           {nav}
@@ -418,7 +529,7 @@ export default function Home() {
           </div>
           <div className="mt-auto rounded-2xl border border-[#315951] bg-[#173b35] p-3.5">
             <div className="mb-2 flex items-center gap-2 text-[12px] font-medium text-[#dbefea]"><KeyRound size={14} className="text-[#8fdbca]" /> Private by default</div>
-            <p className="text-[11px] leading-5 text-[#9db2ab]">Your data stays in the shared workspace. Export an encrypted backup whenever you like.</p>
+            <p className="text-[11px] leading-5 text-[#9db2ab]">Your data stays in your personal budget unless you choose to share it. Export an encrypted backup whenever you like.</p>
             <button onClick={() => setDrawer("collab")} className="mt-3 flex items-center gap-2 text-[12px] font-medium text-[#8fdbca]">Manage sharing <ChevronRight size={14} /></button>
           </div>
         </aside>
@@ -427,15 +538,15 @@ export default function Home() {
 
         <section className="min-w-0 flex-1">
           <header className="sticky top-0 z-20 flex min-h-[74px] items-center justify-between gap-4 border-b border-[#dfe9e4] bg-[#f4f7f5]/95 px-5 backdrop-blur md:px-8">
-            <div className="flex items-center gap-3"><button onClick={() => setMobileNavOpen(true)} className="rounded-lg p-2 text-[#44635c] hover:bg-white lg:hidden" aria-label="Open menu"><Menu size={20} /></button><div><div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.15em] text-[#789089]"><span>Household planning</span><span className="h-1 w-1 rounded-full bg-[#8fdbca]" /><span>{saveState}</span></div><h1 className="mt-1 text-[21px] font-semibold tracking-[-0.035em] text-[#1b302b]">{activeView}</h1></div></div>
-            <div className="flex items-center gap-2"><button onClick={() => setDrawer("builder")} className="hidden items-center gap-2 rounded-xl border border-[#d6e3de] bg-white px-3 py-2 text-[12px] font-medium text-[#36534c] shadow-sm sm:flex"><SlidersHorizontal size={15} /> Customize view</button><button onClick={() => setDrawer("collab")} className="flex items-center gap-2 rounded-xl bg-[#1e5a50] px-3 py-2 text-[12px] font-semibold text-white shadow-[0_5px_13px_rgba(30,90,80,0.18)]"><Share2 size={15} /><span className="hidden sm:inline">Share</span></button><button className="rounded-xl border border-[#d6e3de] bg-white p-2 text-[#526d65] shadow-sm" aria-label="More actions"><MoreHorizontal size={18} /></button></div>
+            <div className="flex items-center gap-3"><button onClick={() => setMobileNavOpen(true)} className="rounded-lg p-2 text-[#44635c] hover:bg-white lg:hidden" aria-label="Open menu"><Menu size={20} /></button><div><div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.15em] text-[#789089]"><span>{workspaceName}</span><span className="h-1 w-1 rounded-full bg-[#8fdbca]" /><span>{saveState}</span></div><h1 className="mt-1 text-[21px] font-semibold tracking-[-0.035em] text-[#1b302b]">{activeView}</h1></div></div>
+            <div className="flex items-center gap-2">{workspaceLinks.length > 0 ? <label className="hidden items-center gap-2 rounded-xl border border-[#d6e3de] bg-white px-3 py-2 text-[12px] text-[#526d65] shadow-sm sm:flex"><span className="text-[#8a9b94]">Budget</span><select value={workspaceId} onChange={(event) => switchWorkspace(event.target.value)} className="max-w-[150px] bg-transparent font-medium outline-none">{workspaceLinks.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label> : null}<button onClick={() => setDrawer("builder")} className="hidden items-center gap-2 rounded-xl border border-[#d6e3de] bg-white px-3 py-2 text-[12px] font-medium text-[#36534c] shadow-sm sm:flex"><SlidersHorizontal size={15} /> Customize view</button><button onClick={() => setDrawer("collab")} className="flex items-center gap-2 rounded-xl bg-[#1e5a50] px-3 py-2 text-[12px] font-semibold text-white shadow-[0_5px_13px_rgba(30,90,80,0.18)]"><Share2 size={15} /><span className="hidden sm:inline">Share</span></button><button className="rounded-xl border border-[#d6e3de] bg-white p-2 text-[#526d65] shadow-sm" aria-label="More actions"><MoreHorizontal size={18} /></button></div>
           </header>
 
           <div className="mx-auto max-w-[1440px] px-5 py-6 md:px-8 md:py-8">
             <div className="mb-6 flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2 text-[13px] text-[#657c74]"><span className="h-2 w-2 rounded-full bg-[#57b99f]" /> Planning model active <span className="text-[#a7b5b0]">·</span> <span>{yearRange}</span></div><div className="flex items-center gap-2"><label className="flex items-center gap-2 rounded-xl border border-[#d6e3de] bg-white px-3 py-2 text-[12px] text-[#526d65] shadow-sm"><CalendarRange size={15} /><span className="hidden sm:inline">Years</span><select value={yearRange} onChange={(event) => setYearRange(event.target.value)} className="bg-transparent font-medium outline-none"><option>2024–2060</option><option>2024–2040</option><option>2040–2060</option></select></label><label className="flex items-center gap-2 rounded-xl border border-[#d6e3de] bg-white px-3 py-2 text-[12px] text-[#526d65] shadow-sm"><GitCompare size={15} /><span className="hidden sm:inline">Scenario</span><select value={scenario} onChange={(event) => setScenario(event.target.value as Scenario)} className="max-w-[145px] bg-transparent font-medium outline-none"><option>Baseline</option><option>No second house</option><option>Conservative income</option></select></label></div></div>
 
             {activeView === "Summary" ? <SummaryView included={included} lifetimeTotal={lifetimeTotal} recurringTotal={recurringTotal} largest={largest} factor={factor} scenario={scenario} setActiveView={setActiveView} openCollab={() => setDrawer("collab")} openImport={() => importInputRef.current?.click()} downloadBlank={downloadBlankSpreadsheet} importError={importError} /> : null}
-            {activeView === "Living expenses" ? <LivingView categories={categories} recurringTotal={recurringTotal} scenario={scenario} setAnnual={setAnnual} /> : null}
+            {activeView === "Living expenses" ? <LivingView categories={categories} recurringTotal={recurringTotal} scenario={scenario} setAnnual={setAnnual} canEdit={canEdit} /> : null}
             {activeView === "Full view" ? <FullView included={included} factor={factor} /> : null}
             {activeView === "Major events" ? <MajorEvents categories={categories} factor={factor} setActiveView={setActiveView} /> : null}
             {activeView === "Income & investing" ? <IncomeView setActiveView={setActiveView} /> : null}
@@ -445,13 +556,13 @@ export default function Home() {
       </div>
 
       {drawer === "builder" ? <Drawer title="Make this view yours" eyebrow="View builder" onClose={() => setDrawer(null)}><div className="mt-7"><label className="text-[11px] font-semibold uppercase tracking-[0.12em] text-[#71877e]">View name</label><input value={viewName} onChange={(event) => setViewName(event.target.value)} placeholder="e.g. Annual budget" className="mt-2 w-full rounded-xl border border-[#d8e6df] bg-white px-3 py-2.5 text-[13px] outline-none focus:border-[#76bda8] focus:ring-2 focus:ring-[#c6e7db]" /></div><div className="mt-7"><div className="flex items-center justify-between"><div className="text-[13px] font-semibold">Categories</div><button onClick={() => setSelectedIds(categories.map((item) => item.id))} className="text-[11px] font-semibold text-[#347a68]">Select all</button></div><div className="mt-3 space-y-2">{categories.map((item) => <button key={item.id} onClick={() => toggleId(item.id)} className="flex w-full items-center gap-3 rounded-xl border border-[#e3ece8] bg-white px-3 py-3 text-left hover:border-[#aed4c5]"><span className={"grid h-5 w-5 place-items-center rounded-md border " + (selectedIds.includes(item.id) ? "border-[#3e947d] bg-[#3e947d] text-white" : "border-[#cbdad3] bg-white text-transparent")}><Check size={13} /></span><span className="h-2.5 w-2.5 rounded-full" style={{ background: item.color }} /><span className="flex-1 text-[13px] font-medium">{item.name}</span><span className="text-[11px] text-[#9aa9a4]">{item.group}</span></button>)}</div></div><div className="mt-7"><div className="text-[13px] font-semibold">Saved views</div><div className="mt-3 space-y-2">{savedViews.map((name) => <div key={name} className="flex items-center justify-between rounded-xl bg-[#f2f8f5] px-3 py-2.5 text-[12px] text-[#527067]"><span>{name}</span><Check size={14} className="text-[#49a083]" /></div>)}</div></div><div className="mt-8 flex gap-2"><button onClick={saveCustomView} className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-[#1e5a50] px-4 py-3 text-[12px] font-semibold text-white"><Save size={15} /> Save view</button><button onClick={() => setDrawer(null)} className="rounded-xl border border-[#d8e6df] px-4 py-3 text-[12px] font-semibold text-[#5e756d]">Done</button></div><div className="mt-6 rounded-xl border border-dashed border-[#c6dbd2] bg-[#f5faf7] p-3 text-[11px] leading-5 text-[#789089]">Press <kbd className="rounded border border-[#d4e3dc] bg-white px-1.5 py-0.5 font-mono text-[10px]">/</kbd> to open this builder, or use <kbd className="rounded border border-[#d4e3dc] bg-white px-1.5 py-0.5 font-mono text-[10px]">g</kbd> then a view key to switch views.</div></Drawer> : null}
-      {drawer === "collab" ? <Drawer title="Collaborate safely" eyebrow="Shared workspace" onClose={() => setDrawer(null)}><div className="mt-6 flex items-center gap-3 rounded-2xl border border-[#cfe6db] bg-[#eff9f4] p-4"><div className="grid h-9 w-9 place-items-center rounded-full bg-[#3f9b86] text-white"><UsersRound size={17} /></div><div><div className="text-[13px] font-semibold text-[#2e6254]">Private and shared</div><div className="mt-1 text-[11px] text-[#6f8d82]">Signed-in collaborators can view or edit</div></div></div><div className="mt-7"><div className="flex items-center justify-between"><div className="text-[13px] font-semibold">People</div><button onClick={copyInviteLink} className="flex items-center gap-1.5 rounded-lg bg-[#eaf5f0] px-2.5 py-1.5 text-[11px] font-semibold text-[#347a68]"><Plus size={13} /> {inviteCopied ? "Copied" : "Invite"}</button></div><div className="mt-3 space-y-2"><Person name="You" role="Owner · active now" initials="Y" color="#356c64" /></div></div><div className="mt-7"><div className="text-[13px] font-semibold">Backup and access</div><div className="mt-3 space-y-2"><BackupButton icon={DownloadIcon} title="Download encrypted backup" detail="Save a private copy on this computer" onClick={downloadBackup} /><BackupButton icon={Upload} title="Restore encrypted backup" detail="Upload a private copy from this computer" onClick={restoreBackup} /><BackupButton icon={FileSpreadsheet} title="Export to spreadsheet" detail="Keep an editable Excel copy" onClick={downloadSpreadsheet} /><BackupButton icon={History} title="View change history" detail="Restore an earlier version" /></div></div><div className="mt-7 rounded-xl border border-dashed border-[#c6dbd2] bg-[#f5faf7] p-3 text-[11px] leading-5 text-[#789089]"><KeyRound size={14} className="mb-1 text-[#4d8d7d]" /> Backups will be encrypted before they leave the app. The public website contains the app, not your financial file.</div></Drawer> : null}
+      {drawer === "collab" ? <Drawer title={workspaceName} eyebrow="Budget sharing" onClose={() => setDrawer(null)}><div className="mt-6 flex items-center gap-3 rounded-2xl border border-[#cfe6db] bg-[#eff9f4] p-4"><div className="grid h-9 w-9 place-items-center rounded-full bg-[#3f9b86] text-white"><UsersRound size={17} /></div><div><div className="text-[13px] font-semibold text-[#2e6254]">Private by default</div><div className="mt-1 text-[11px] text-[#6f8d82]">Only people with an invitation can access this budget.</div></div></div><div className="mt-7"><div className="flex items-center justify-between"><div><div className="text-[13px] font-semibold">People</div><div className="mt-1 text-[11px] text-[#91a19b]">Collaborators update together in real time.</div></div></div><div className="mt-3 space-y-2"><Person name="You" role={canEdit ? "Can edit · active now" : "View only · active now"} initials="Y" color="#356c64" /></div></div><div className="mt-7 rounded-2xl border border-[#dfe9e4] bg-white p-4"><div className="text-[13px] font-semibold">Invite to this budget</div><p className="mt-1 text-[11px] leading-5 text-[#81938c]">Create a private link and send it to someone you trust.</p><div className="mt-4 flex items-center gap-2"><select value={inviteRole} onChange={(event) => setInviteRole(event.target.value as "editor" | "viewer")} disabled={!canEdit} className="min-w-0 flex-1 rounded-lg border border-[#d8e6df] bg-white px-2.5 py-2 text-[12px] text-[#526d65]"><option value="editor">Can edit</option><option value="viewer">View only</option></select><button onClick={createInviteLink} disabled={!canEdit} className="flex items-center gap-1.5 rounded-lg bg-[#1e5a50] px-3 py-2 text-[11px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"><Plus size={13} /> {inviteCopied ? "Copied" : "Create invite"}</button></div>{inviteMessage ? <p className="mt-3 text-[11px] leading-5 text-[#347a68]">{inviteMessage}</p> : null}</div><div className="mt-7"><div className="text-[13px] font-semibold">Backup and access</div><div className="mt-3 space-y-2"><BackupButton icon={DownloadIcon} title="Download encrypted backup" detail="Save a private copy on this computer" onClick={downloadBackup} /><BackupButton icon={Upload} title="Restore encrypted backup" detail="Upload a private copy from this computer" onClick={restoreBackup} /><BackupButton icon={FileSpreadsheet} title="Export to spreadsheet" detail="Keep an editable Excel copy" onClick={downloadSpreadsheet} /><BackupButton icon={History} title="View change history" detail="Restore an earlier version" /></div></div><div className="mt-7 rounded-xl border border-dashed border-[#c6dbd2] bg-[#f5faf7] p-3 text-[11px] leading-5 text-[#789089]"><KeyRound size={14} className="mb-1 text-[#4d8d7d]" /> Backups are encrypted before they leave the app. The public website contains the app, not your financial file.</div></Drawer> : null}
     </main>
   );
 }
 
 function AuthScreen({ mode, email, password, error, onModeChange, onEmailChange, onPasswordChange, onSubmit }: { mode: "signIn" | "register"; email: string; password: string; error: string; onModeChange: (mode: "signIn" | "register") => void; onEmailChange: (value: string) => void; onPasswordChange: (value: string) => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
-  return <main className="grid min-h-screen place-items-center bg-[#f4f7f5] px-5 text-[#1c2a27]"><form onSubmit={onSubmit} className="w-full max-w-[410px] rounded-3xl border border-[#dfe9e4] bg-white p-7 shadow-[0_18px_50px_rgba(32,62,53,0.08)]"><div className="mb-7"><div className="grid h-11 w-11 place-items-center rounded-2xl bg-[#8fdbca] text-[#153d36]"><Sparkles size={20} /></div><h1 className="mt-5 text-[25px] font-semibold tracking-[-0.04em]">Lifetime planner</h1><p className="mt-2 text-[13px] leading-5 text-[#74827d]">Sign in to the shared household workspace.</p></div><label className="block text-[11px] font-semibold uppercase tracking-[0.12em] text-[#71877e]">Email<input required type="email" value={email} onChange={(event) => onEmailChange(event.target.value)} className="mt-2 w-full rounded-xl border border-[#d8e6df] px-3 py-3 text-[13px] outline-none focus:border-[#76bda8]" /></label><label className="mt-4 block text-[11px] font-semibold uppercase tracking-[0.12em] text-[#71877e]">Password<input required minLength={6} type="password" value={password} onChange={(event) => onPasswordChange(event.target.value)} className="mt-2 w-full rounded-xl border border-[#d8e6df] px-3 py-3 text-[13px] outline-none focus:border-[#76bda8]" /></label>{error ? <p className="mt-3 text-[12px] text-[#a14d4d]">{error}</p> : null}<button type="submit" className="mt-6 w-full rounded-xl bg-[#1e5a50] px-4 py-3 text-[13px] font-semibold text-white">{mode === "register" ? "Create account" : "Sign in"}</button><button type="button" onClick={() => onModeChange(mode === "register" ? "signIn" : "register")} className="mt-4 w-full text-[12px] font-semibold text-[#347a68]">{mode === "register" ? "Already have an account? Sign in" : "New collaborator? Create an account"}</button><p className="mt-6 rounded-xl border border-dashed border-[#c6dbd2] bg-[#f5faf7] p-3 text-[11px] leading-5 text-[#789089]">Each collaborator uses their own Firebase login. Everyone who signs in can edit this shared household workspace.</p></form></main>;
+  return <main className="grid min-h-screen place-items-center bg-[#f4f7f5] px-5 text-[#1c2a27]"><form onSubmit={onSubmit} className="w-full max-w-[410px] rounded-3xl border border-[#dfe9e4] bg-white p-7 shadow-[0_18px_50px_rgba(32,62,53,0.08)]"><div className="mb-7"><div className="grid h-11 w-11 place-items-center rounded-2xl bg-[#8fdbca] text-[#153d36]"><Sparkles size={20} /></div><h1 className="mt-5 text-[25px] font-semibold tracking-[-0.04em]">Lifetime planner</h1><p className="mt-2 text-[13px] leading-5 text-[#74827d]">Sign in to keep your personal budgets private.</p></div><label className="block text-[11px] font-semibold uppercase tracking-[0.12em] text-[#71877e]">Email<input required type="email" value={email} onChange={(event) => onEmailChange(event.target.value)} className="mt-2 w-full rounded-xl border border-[#d8e6df] px-3 py-3 text-[13px] outline-none focus:border-[#76bda8]" /></label><label className="mt-4 block text-[11px] font-semibold uppercase tracking-[0.12em] text-[#71877e]">Password<input required minLength={6} type="password" value={password} onChange={(event) => onPasswordChange(event.target.value)} className="mt-2 w-full rounded-xl border border-[#d8e6df] px-3 py-3 text-[13px] outline-none focus:border-[#76bda8]" /></label>{error ? <p className="mt-3 text-[12px] text-[#a14d4d]">{error}</p> : null}<button type="submit" className="mt-6 w-full rounded-xl bg-[#1e5a50] px-4 py-3 text-[13px] font-semibold text-white">{mode === "register" ? "Create account" : "Sign in"}</button><button type="button" onClick={() => onModeChange(mode === "register" ? "signIn" : "register")} className="mt-4 w-full text-[12px] font-semibold text-[#347a68]">{mode === "register" ? "Already have an account? Sign in" : "New collaborator? Create an account"}</button><p className="mt-6 rounded-xl border border-dashed border-[#c6dbd2] bg-[#f5faf7] p-3 text-[11px] leading-5 text-[#789089]">Create your own budget, then use invitations to share it with selected collaborators.</p></form></main>;
 }
 
 function BookOpenIcon() { return <span className="grid h-4 w-4 place-items-center rounded border border-[#54776e] text-[9px]">V</span>; }
@@ -464,7 +575,7 @@ function SummaryView({ included, lifetimeTotal, recurringTotal, largest, factor,
     <>
       <section className="mb-5 rounded-2xl border border-[#dfe9e4] bg-[#eef8f3] p-5 md:p-6">
         <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-          <div><div className="text-[10px] font-semibold uppercase tracking-[0.15em] text-[#4d8d7d]">Start here</div><h2 className="mt-2 text-[19px] font-semibold tracking-[-0.03em]">Build your planning model</h2><p className="mt-1 max-w-[650px] text-[13px] leading-5 text-[#638077]">Fill it out directly on the site, or import the workbook you already use. The original workbook is read in your browser; only the planning model is saved to the shared workspace.</p></div>
+          <div><div className="text-[10px] font-semibold uppercase tracking-[0.15em] text-[#4d8d7d]">Start here</div><h2 className="mt-2 text-[19px] font-semibold tracking-[-0.03em]">Build your planning model</h2><p className="mt-1 max-w-[650px] text-[13px] leading-5 text-[#638077]">Fill it out directly on the site, or import the workbook you already use. The original workbook is read in your browser; only the planning model is saved to the current budget.</p></div>
           <div className="flex shrink-0 flex-wrap gap-2"><button onClick={openImport} className="rounded-xl bg-[#1e5a50] px-3 py-2.5 text-[12px] font-semibold text-white">Import workbook</button><button onClick={downloadBlank} className="rounded-xl border border-[#bed8cc] bg-white px-3 py-2.5 text-[12px] font-semibold text-[#347a68]">Download blank template</button></div>
         </div>
         {importError ? <p className="mt-3 text-[12px] text-[#a14d4d]">{importError}</p> : null}
@@ -497,8 +608,8 @@ function Metric({ label, value, note, icon: Icon, color }: { label: string; valu
 }
 function Activity({ person, text, time, color }: { person: string; text: string; time: string; color: string }) { return <div className="flex gap-3"><div className="grid h-8 w-8 shrink-0 place-items-center rounded-full text-[11px] font-semibold text-white" style={{ background: color }}>{person[0]}</div><div><p className="text-[12px] leading-5 text-[#506861]"><span className="font-semibold text-[#294a41]">{person}</span> {text}</p><div className="mt-0.5 text-[10px] text-[#9aa9a4]">{time}</div></div></div>; }
 
-function LivingView({ categories, recurringTotal, scenario, setAnnual }: { categories: Category[]; recurringTotal: number; scenario: Scenario; setAnnual: (id: string, value: number) => void }) {
-  return <section className="rounded-2xl border border-[#dfe9e4] bg-white p-5 shadow-[0_8px_22px_rgba(32,62,53,0.045)] md:p-6"><SectionTitle title="Living expenses" description="Edit the annual baseline. Every other view reads the same values." action={<button className="flex items-center gap-2 rounded-xl bg-[#eaf5f0] px-3 py-2 text-[12px] font-semibold text-[#2c7765]"><Plus size={15} /> Add expense</button>} /><div className="mb-5 grid gap-3 sm:grid-cols-3"><Mini label="Annual baseline" value={money(recurringTotal)} /><Mini label="Per month" value={money(recurringTotal / 12)} /><Mini label="Scenario" value={scenario} /></div><div className="overflow-x-auto"><table className="w-full min-w-[720px] text-left"><thead><tr className="border-b border-[#e7eeeb] text-[10px] font-semibold uppercase tracking-[0.12em] text-[#91a09b]"><th className="pb-3">Expense</th><th className="pb-3">Type</th><th className="pb-3">Annual amount</th><th className="pb-3">Inflation</th><th className="pb-3">Applies to</th></tr></thead><tbody>{categories.filter((item) => item.group === "Recurring").map((item) => <tr key={item.id} className="border-b border-[#edf2ef] last:border-0"><td className="py-4"><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full" style={{ background: item.color }} />{item.name}</td><td className="py-4 text-[12px] text-[#788c84]">Recurring</td><td className="py-4"><div className="flex w-[145px] items-center rounded-lg border border-[#dbe8e2] bg-[#fbfdfc] px-2.5 focus-within:border-[#82bea9]"><span className="text-[12px] text-[#80958d]">$</span><input aria-label={item.name + " annual amount"} type="number" value={Math.round(item.annual)} onChange={(event) => setAnnual(item.id, Number(event.target.value))} className="w-full bg-transparent px-1.5 py-2 text-[13px] font-semibold outline-none" /></div></td><td className="py-4"><select className="rounded-lg border border-[#dbe8e2] bg-white px-2 py-2 text-[12px] text-[#526d65]"><option>Inflation</option><option>Fixed</option><option>Custom</option></select></td><td className="py-4 text-[12px] text-[#788c84]">Household</td></tr>)}</tbody></table></div></section>;
+function LivingView({ categories, recurringTotal, scenario, setAnnual, canEdit }: { categories: Category[]; recurringTotal: number; scenario: Scenario; setAnnual: (id: string, value: number) => void; canEdit: boolean }) {
+  return <section className="rounded-2xl border border-[#dfe9e4] bg-white p-5 shadow-[0_8px_22px_rgba(32,62,53,0.045)] md:p-6"><SectionTitle title="Living expenses" description="Edit the annual baseline. Every other view reads the same values." action={<button className="flex items-center gap-2 rounded-xl bg-[#eaf5f0] px-3 py-2 text-[12px] font-semibold text-[#2c7765]"><Plus size={15} /> Add expense</button>} /><div className="mb-5 grid gap-3 sm:grid-cols-3"><Mini label="Annual baseline" value={money(recurringTotal)} /><Mini label="Per month" value={money(recurringTotal / 12)} /><Mini label="Scenario" value={scenario} /></div><div className="overflow-x-auto"><table className="w-full min-w-[720px] text-left"><thead><tr className="border-b border-[#e7eeeb] text-[10px] font-semibold uppercase tracking-[0.12em] text-[#91a09b]"><th className="pb-3">Expense</th><th className="pb-3">Type</th><th className="pb-3">Annual amount</th><th className="pb-3">Inflation</th><th className="pb-3">Applies to</th></tr></thead><tbody>{categories.filter((item) => item.group === "Recurring").map((item) => <tr key={item.id} className="border-b border-[#edf2ef] last:border-0"><td className="py-4"><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full" style={{ background: item.color }} />{item.name}</td><td className="py-4 text-[12px] text-[#788c84]">Recurring</td><td className="py-4"><div className="flex w-[145px] items-center rounded-lg border border-[#dbe8e2] bg-[#fbfdfc] px-2.5 focus-within:border-[#82bea9]"><span className="text-[12px] text-[#80958d]">$</span><input aria-label={item.name + " annual amount"} disabled={!canEdit} type="number" value={Math.round(item.annual)} onChange={(event) => setAnnual(item.id, Number(event.target.value))} className="w-full bg-transparent px-1.5 py-2 text-[13px] font-semibold outline-none" /></div></td><td className="py-4"><select className="rounded-lg border border-[#dbe8e2] bg-white px-2 py-2 text-[12px] text-[#526d65]"><option>Inflation</option><option>Fixed</option><option>Custom</option></select></td><td className="py-4 text-[12px] text-[#788c84]">Household</td></tr>)}</tbody></table></div></section>;
 }
 function Mini({ label, value }: { label: string; value: string }) { return <div className="rounded-xl bg-[#f2f8f5] p-3"><div className="text-[11px] text-[#789089]">{label}</div><div className="mt-1 text-xl font-semibold">{value}</div></div>; }
 

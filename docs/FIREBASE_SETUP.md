@@ -18,4 +18,4 @@
 
 After signing in, the Summary screen offers two starting paths: fill the model out directly, or choose **Import workbook**. The importer reads the workbook in your browser, prefers the Latest Full Data with Notes sheet, and saves only the mapped planning model to Firebase. The original workbook is never uploaded to GitHub.
 
-The web configuration values are intended for browser use. Do not add a Firebase service-account key or private credential to the repository. Each collaborator creates their own account in the planner, and the app stores the shared snapshot at `workspaces/household`.
+The web configuration values are intended for browser use. Do not add a Firebase service-account key or private credential to the repository. Each user gets a personal budget under workspaces/{workspaceId}. Sharing creates an invitation document; accepting it adds a membership and makes that budget available in the user budget selector. Publish the current contents of firestore.rules after updating the app.
