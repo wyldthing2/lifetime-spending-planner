@@ -10,6 +10,34 @@ export type Category = {
 
 export type Scenario = "Baseline" | "No second house" | "Conservative income";
 
+export type DetailMetric = number | string | null;
+
+export type DetailRow = {
+  id: string;
+  section: string;
+  categoryId: string;
+  label: string;
+  metrics: Record<string, DetailMetric>;
+  notes?: string;
+};
+
+export type AnnualPlanRow = {
+  year: number;
+  income: number;
+  afterInvestingAndTithing: number;
+  houseSales: number;
+  living: number;
+  cars: number;
+  housing: number;
+  healthcare: number;
+  college: number;
+  missions: number;
+  downPayments: number;
+  investing: number;
+  netSavings: number;
+  accruingSavings: number;
+};
+
 export const seedCategories: Category[] = [
   { id: "living", name: "Living expenses", group: "Recurring", lifetime: 0, annual: 0, peak: 2024, color: "#5B8C85" },
   { id: "house", name: "Housing", group: "Major events", lifetime: 0, annual: 0, peak: 2024, color: "#D9895B" },
@@ -28,6 +56,8 @@ export type PlannerSnapshot = {
   savedViews: string[];
   scenario: Scenario;
   yearRange: string;
+  detailRows: DetailRow[];
+  annualPlan: AnnualPlanRow[];
 };
 
 export const initialSnapshot: PlannerSnapshot = {
@@ -36,5 +66,7 @@ export const initialSnapshot: PlannerSnapshot = {
   savedViews: ["My annual budget", "Family goals"],
   scenario: "Baseline",
   yearRange: "2024–2060",
+  detailRows: [],
+  annualPlan: [],
 };
 

@@ -5,6 +5,8 @@ service cloud.firestore {
     function signedIn() { return request.auth != null; }
     function isMember(workspaceId) { return signedIn() && exists(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)); }
     function canEdit(workspaceId) { return isMember(workspaceId) && get(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)).data.role in ['owner', 'editor']; }
+    function isOwner(workspaceId) { return signedIn() && get(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)).data.role == 'owner'; }
+    function canEditData(workspaceId) { return canEdit(workspaceId) && request.resource.data.ownerId == resource.data.ownerId && request.resource.data.name == resource.data.name; }
 
     match /users/{userId} {
       allow read, write: if signedIn() && request.auth.uid == userId;
@@ -16,7 +18,7 @@ service cloud.firestore {
     match /workspaces/{workspaceId} {
       allow read: if isMember(workspaceId) || (signedIn() && workspaceId == request.auth.uid) || (workspaceId == 'household' && signedIn() && !resource.data.keys().hasAny(['ownerId' ]));
       allow create: if signedIn() && request.resource.data.ownerId == request.auth.uid;
-      allow update: if canEdit(workspaceId) || (workspaceId == 'household' && signedIn() && !resource.data.keys().hasAny(['ownerId' ]) && request.resource.data.ownerId == request.auth.uid);
+      allow update: if isOwner(workspaceId) || canEditData(workspaceId) || (workspaceId == 'household' && signedIn() && !resource.data.keys().hasAny(['ownerId' ]) && request.resource.data.ownerId == request.auth.uid);
       allow delete: if false;
 
       match /members/{memberId} {

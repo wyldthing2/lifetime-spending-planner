@@ -11,7 +11,7 @@ import { onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndP
 import { addDoc, collection, doc, getDoc, getDocs, onSnapshot, runTransaction, serverTimestamp, setDoc } from "firebase/firestore";
 import { firebaseConfigured, getFirebaseServices } from "@/lib/firebase";
 import { createBlankWorkbook, importLifetimeWorkbook } from "@/lib/workbook-import";
-import { Category, Scenario, initialSnapshot } from "@/lib/planner-data";
+import { Category, Scenario, initialSnapshot, type DetailMetric, type DetailRow, type AnnualPlanRow } from "@/lib/planner-data";
 
 const navItems = [
   ["Summary", BarChart3],
@@ -20,6 +20,7 @@ const navItems = [
   ["Major events", CalendarRange],
   ["Income & investing", Target],
   ["Scenario compare", GitCompare],
+  ["Workbook details", FileSpreadsheet],
 ] as const;
 
 const years = [2024, 2028, 2032, 2036, 2040, 2044, 2048, 2052, 2056, 2060];
@@ -63,10 +64,23 @@ function downloadFile(name: string, contents: string, type: string) {
   URL.revokeObjectURL(url);
 }
 
-function isPlannerSnapshot(value: unknown): value is typeof initialSnapshot {
+function isPlannerSnapshot(value: unknown): value is Partial<typeof initialSnapshot> {
   if (!value || typeof value !== "object") return false;
   const item = value as Partial<typeof initialSnapshot>;
   return Array.isArray(item.categories) && Array.isArray(item.selectedIds) && Array.isArray(item.savedViews) && typeof item.scenario === "string" && typeof item.yearRange === "string";
+}
+
+function normalizeSnapshot(value: unknown): typeof initialSnapshot {
+  const item = isPlannerSnapshot(value) ? value : {};
+  return {
+    categories: item.categories ?? initialSnapshot.categories,
+    selectedIds: item.selectedIds ?? initialSnapshot.selectedIds,
+    savedViews: item.savedViews ?? initialSnapshot.savedViews,
+    scenario: item.scenario ?? initialSnapshot.scenario,
+    yearRange: item.yearRange ?? initialSnapshot.yearRange,
+    detailRows: Array.isArray(item.detailRows) ? item.detailRows : [],
+    annualPlan: Array.isArray(item.annualPlan) ? item.annualPlan : [],
+  };
 }
 
 function SectionTitle({ title, description, action }: { title: string; description?: string; action?: React.ReactNode }) {
@@ -103,6 +117,8 @@ export default function Home() {
   const [categories, setCategories] = useState(initialSnapshot.categories);
   const [scenario, setScenario] = useState<Scenario>("Baseline");
   const [yearRange, setYearRange] = useState("2024–2060");
+  const [detailRows, setDetailRows] = useState<DetailRow[]>(initialSnapshot.detailRows);
+  const [annualPlan, setAnnualPlan] = useState<AnnualPlanRow[]>(initialSnapshot.annualPlan);
   const [drawer, setDrawer] = useState<"collab" | "builder" | null>(null);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [selectedIds, setSelectedIds] = useState(initialSnapshot.selectedIds);
@@ -129,6 +145,7 @@ export default function Home() {
   const importInputRef = useRef<HTMLInputElement>(null);
   const [importError, setImportError] = useState("");
   const [inviteCopied, setInviteCopied] = useState(false);
+  const [renameMessage, setRenameMessage] = useState("");
 
   useEffect(() => {
     if (!firebaseEnabled) {
@@ -237,11 +254,14 @@ export default function Home() {
         if (!response.ok) throw new Error("workspace unavailable");
         const payload = await response.json() as { version: number; data: typeof initialSnapshot };
         if (cancelled) return;
-        setCategories(payload.data.categories);
-        setSelectedIds(payload.data.selectedIds);
-        setSavedViews(payload.data.savedViews);
-        setScenario(payload.data.scenario);
-        setYearRange(payload.data.yearRange);
+        const snapshot = normalizeSnapshot(payload.data);
+        setCategories(snapshot.categories);
+        setSelectedIds(snapshot.selectedIds);
+        setSavedViews(snapshot.savedViews);
+        setScenario(snapshot.scenario);
+        setYearRange(snapshot.yearRange);
+        setDetailRows(snapshot.detailRows);
+        setAnnualPlan(snapshot.annualPlan);
         setRevision(payload.version);
         setSaveState("Synced");
       } catch {
@@ -256,11 +276,14 @@ export default function Home() {
         if (!response.ok || cancelled) return;
         const payload = await response.json() as { version: number; data: typeof initialSnapshot };
         if (payload.version <= revision) return;
-        setCategories(payload.data.categories);
-        setSelectedIds(payload.data.selectedIds);
-        setSavedViews(payload.data.savedViews);
-        setScenario(payload.data.scenario);
-        setYearRange(payload.data.yearRange);
+        const snapshot = normalizeSnapshot(payload.data);
+        setCategories(snapshot.categories);
+        setSelectedIds(snapshot.selectedIds);
+        setSavedViews(snapshot.savedViews);
+        setScenario(snapshot.scenario);
+        setYearRange(snapshot.yearRange);
+        setDetailRows(snapshot.detailRows);
+        setAnnualPlan(snapshot.annualPlan);
         setRevision(payload.version);
         setSaveState("Updated by collaborator");
       }).catch(() => undefined);
@@ -274,7 +297,7 @@ export default function Home() {
       void fetch("/api/workspace", {
         method: "PUT",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ version: revision, data: { categories, selectedIds, savedViews, scenario, yearRange } }),
+        body: JSON.stringify({ version: revision, data: { categories, selectedIds, savedViews, scenario, yearRange, detailRows, annualPlan } }),
       }).then(async (response) => {
         if (response.status === 409) { setSaveState("Changed by collaborator"); return; }
         if (!response.ok) throw new Error("save failed");
@@ -284,7 +307,7 @@ export default function Home() {
       }).catch(() => setSaveState("Saved locally for now"));
     }, 450);
     return () => window.clearTimeout(timer);
-  }, [categories, selectedIds, savedViews, scenario, yearRange, hydrated, revision, firebaseEnabled]);
+  }, [categories, selectedIds, savedViews, scenario, yearRange, detailRows, annualPlan, hydrated, revision, firebaseEnabled]);
 
   useEffect(() => {
     if (!firebaseEnabled || !firebaseReady || !firebaseUser || !workspaceReady || !workspaceId || !firebaseRef.current) return;
@@ -295,15 +318,19 @@ export default function Home() {
         setSaveState("Budget unavailable");
         return;
       }
-      const payload = snapshot.data() as { version?: unknown; data?: unknown };
+      const payload = snapshot.data() as { version?: unknown; data?: unknown; name?: unknown };
       if (!isPlannerSnapshot(payload.data)) return;
+      const remote = normalizeSnapshot(payload.data);
       const version = typeof payload.version === "number" ? payload.version : 1;
       skipRemoteRevision.current = version;
-      setCategories(payload.data.categories);
-      setSelectedIds(payload.data.selectedIds);
-      setSavedViews(payload.data.savedViews);
-      setScenario(payload.data.scenario);
-      setYearRange(payload.data.yearRange);
+      setCategories(remote.categories);
+      setSelectedIds(remote.selectedIds);
+      setSavedViews(remote.savedViews);
+      setScenario(remote.scenario);
+      setYearRange(remote.yearRange);
+      setDetailRows(remote.detailRows);
+      setAnnualPlan(remote.annualPlan);
+      if (typeof payload.name === "string") setWorkspaceLinks((current) => current.map((item) => item.id === workspaceId ? { ...item, name: payload.name as string } : item));
       setRevision(version);
       setHydrated(true);
       setSaveState("Synced");
@@ -325,7 +352,7 @@ export default function Home() {
         const currentVersion = current.exists() && typeof current.data().version === "number" ? current.data().version as number : 0;
         if (currentVersion > revision) throw new Error("CONFLICT");
         const nextVersion = currentVersion + 1;
-        transaction.set(snapshotRef, { version: nextVersion, data: { categories, selectedIds, savedViews, scenario, yearRange }, updatedBy: firebaseUser.uid, updatedAt: serverTimestamp() }, { merge: true });
+        transaction.set(snapshotRef, { version: nextVersion, data: { categories, selectedIds, savedViews, scenario, yearRange, detailRows, annualPlan }, updatedBy: firebaseUser.uid, updatedAt: serverTimestamp() }, { merge: true });
         return nextVersion;
       }).then((nextVersion) => {
         skipRemoteRevision.current = nextVersion;
@@ -334,7 +361,7 @@ export default function Home() {
       }).catch((error: unknown) => setSaveState(error instanceof Error && error.message === "CONFLICT" ? "Changed by collaborator" : "Could not save to Firebase"));
     }, 450);
     return () => window.clearTimeout(timer);
-  }, [categories, selectedIds, savedViews, scenario, yearRange, hydrated, revision, firebaseEnabled, firebaseReady, firebaseUser, workspaceReady, workspaceId, canEdit]);
+  }, [categories, selectedIds, savedViews, scenario, yearRange, detailRows, annualPlan, hydrated, revision, firebaseEnabled, firebaseReady, firebaseUser, workspaceReady, workspaceId, canEdit]);
 
   useEffect(() => {
     let sequence = "";
@@ -344,7 +371,7 @@ export default function Home() {
       }
       if (event.key.toLowerCase() === "g") sequence = "g";
       else if (sequence === "g") {
-        const route: Record<string, string> = { s: "Summary", f: "Full view", l: "Living expenses", m: "Major events", i: "Income & investing", c: "Scenario compare" };
+        const route: Record<string, string> = { s: "Summary", f: "Full view", l: "Living expenses", m: "Major events", i: "Income & investing", c: "Scenario compare", d: "Workbook details" };
         if (route[event.key.toLowerCase()]) setActiveView(route[event.key.toLowerCase()]);
         sequence = "";
       } else sequence = "";
@@ -359,6 +386,7 @@ export default function Home() {
   const recurringTotal = included.filter((item) => item.group === "Recurring").reduce((sum, item) => sum + item.annual * factor, 0);
   const largest = [...included].sort((a, b) => b.lifetime - a.lifetime)[0];
   const workspaceName = workspaceLinks.find((item) => item.id === workspaceId)?.name ?? "My budget";
+  const isOwner = workspaceLinks.find((item) => item.id === workspaceId)?.role === "owner";
 
   const setAnnual = (id: string, value: number) => {
     if (!canEdit) { setSaveState("View only"); return; }
@@ -376,6 +404,29 @@ export default function Home() {
     setSavedViews((current) => [...current.filter((item) => item !== name), name]);
     setViewName("");
     setSaveState("View saved just now");
+  };
+
+  const setDetailMetric = (rowId: string, key: string, rawValue: string) => {
+    if (!canEdit) { setSaveState("View only"); return; }
+    const numeric = rawValue.trim() === "" ? null : Number(rawValue);
+    const value: DetailMetric = rawValue.trim() === "" ? null : Number.isFinite(numeric) ? numeric : rawValue;
+    setDetailRows((current) => current.map((row) => row.id === rowId ? { ...row, metrics: { ...row.metrics, [key]: value } } : row));
+    setSaveState("Unsaved changes");
+  };
+
+  const renameWorkspace = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!isOwner || !firebaseRef.current || !firebaseUser || !workspaceId) return;
+    const value = new FormData(event.currentTarget).get("budgetName");
+    const name = typeof value === "string" ? value.trim().slice(0, 60) : "";
+    if (!name) { setRenameMessage("Enter a name for this budget."); return; }
+    try {
+      await setDoc(doc(firebaseRef.current.db, "workspaces", workspaceId), { name }, { merge: true });
+      await setDoc(doc(firebaseRef.current.db, "users", firebaseUser.uid, "workspaces", workspaceId), { name }, { merge: true });
+      setWorkspaceLinks((current) => current.map((item) => item.id === workspaceId ? { ...item, name } : item));
+      setRenameMessage("Budget name saved.");
+      setSaveState("Budget name saved");
+    } catch { setRenameMessage("The budget name could not be saved."); }
   };
 
   const submitAuth = async (event: FormEvent<HTMLFormElement>) => {
@@ -407,6 +458,8 @@ export default function Home() {
       setSavedViews(result.snapshot.savedViews);
       setScenario(result.snapshot.scenario);
       setYearRange(result.snapshot.yearRange);
+      setDetailRows(result.snapshot.detailRows);
+      setAnnualPlan(result.snapshot.annualPlan);
       skipRemoteRevision.current = -1;
       setHydrated(true);
       setSaveState("Imported " + result.matched + " categories from " + result.sheetName);
@@ -457,7 +510,7 @@ export default function Home() {
     const salt = crypto.getRandomValues(new Uint8Array(16));
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const key = await backupKey(password, salt);
-    const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv as unknown as BufferSource }, key, new TextEncoder().encode(JSON.stringify({ categories, selectedIds, savedViews, scenario, yearRange })));
+    const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv as unknown as BufferSource }, key, new TextEncoder().encode(JSON.stringify({ categories, selectedIds, savedViews, scenario, yearRange, detailRows, annualPlan })));
     downloadFile("lifetime-planner-backup.lifetime", JSON.stringify({ format: "lifetime-planner", version: 1, salt: base64(salt), iv: base64(iv), data: base64(new Uint8Array(encrypted)) }), "application/json");
     setSaveState("Encrypted backup downloaded");
   };
@@ -483,6 +536,8 @@ export default function Home() {
           setSavedViews(data.savedViews);
           setScenario(data.scenario);
           setYearRange(data.yearRange);
+          setDetailRows(Array.isArray(data.detailRows) ? data.detailRows : []);
+          setAnnualPlan(Array.isArray(data.annualPlan) ? data.annualPlan : []);
           skipRemoteRevision.current = -1;
           setSaveState("Restored, syncing…");
         } catch {
@@ -556,7 +611,7 @@ export default function Home() {
       </div>
 
       {drawer === "builder" ? <Drawer title="Make this view yours" eyebrow="View builder" onClose={() => setDrawer(null)}><div className="mt-7"><label className="text-[11px] font-semibold uppercase tracking-[0.12em] text-[#71877e]">View name</label><input value={viewName} onChange={(event) => setViewName(event.target.value)} placeholder="e.g. Annual budget" className="mt-2 w-full rounded-xl border border-[#d8e6df] bg-white px-3 py-2.5 text-[13px] outline-none focus:border-[#76bda8] focus:ring-2 focus:ring-[#c6e7db]" /></div><div className="mt-7"><div className="flex items-center justify-between"><div className="text-[13px] font-semibold">Categories</div><button onClick={() => setSelectedIds(categories.map((item) => item.id))} className="text-[11px] font-semibold text-[#347a68]">Select all</button></div><div className="mt-3 space-y-2">{categories.map((item) => <button key={item.id} onClick={() => toggleId(item.id)} className="flex w-full items-center gap-3 rounded-xl border border-[#e3ece8] bg-white px-3 py-3 text-left hover:border-[#aed4c5]"><span className={"grid h-5 w-5 place-items-center rounded-md border " + (selectedIds.includes(item.id) ? "border-[#3e947d] bg-[#3e947d] text-white" : "border-[#cbdad3] bg-white text-transparent")}><Check size={13} /></span><span className="h-2.5 w-2.5 rounded-full" style={{ background: item.color }} /><span className="flex-1 text-[13px] font-medium">{item.name}</span><span className="text-[11px] text-[#9aa9a4]">{item.group}</span></button>)}</div></div><div className="mt-7"><div className="text-[13px] font-semibold">Saved views</div><div className="mt-3 space-y-2">{savedViews.map((name) => <div key={name} className="flex items-center justify-between rounded-xl bg-[#f2f8f5] px-3 py-2.5 text-[12px] text-[#527067]"><span>{name}</span><Check size={14} className="text-[#49a083]" /></div>)}</div></div><div className="mt-8 flex gap-2"><button onClick={saveCustomView} className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-[#1e5a50] px-4 py-3 text-[12px] font-semibold text-white"><Save size={15} /> Save view</button><button onClick={() => setDrawer(null)} className="rounded-xl border border-[#d8e6df] px-4 py-3 text-[12px] font-semibold text-[#5e756d]">Done</button></div><div className="mt-6 rounded-xl border border-dashed border-[#c6dbd2] bg-[#f5faf7] p-3 text-[11px] leading-5 text-[#789089]">Press <kbd className="rounded border border-[#d4e3dc] bg-white px-1.5 py-0.5 font-mono text-[10px]">/</kbd> to open this builder, or use <kbd className="rounded border border-[#d4e3dc] bg-white px-1.5 py-0.5 font-mono text-[10px]">g</kbd> then a view key to switch views.</div></Drawer> : null}
-      {drawer === "collab" ? <Drawer title={workspaceName} eyebrow="Budget sharing" onClose={() => setDrawer(null)}><div className="mt-6 flex items-center gap-3 rounded-2xl border border-[#cfe6db] bg-[#eff9f4] p-4"><div className="grid h-9 w-9 place-items-center rounded-full bg-[#3f9b86] text-white"><UsersRound size={17} /></div><div><div className="text-[13px] font-semibold text-[#2e6254]">Private by default</div><div className="mt-1 text-[11px] text-[#6f8d82]">Only people with an invitation can access this budget.</div></div></div><div className="mt-7"><div className="flex items-center justify-between"><div><div className="text-[13px] font-semibold">People</div><div className="mt-1 text-[11px] text-[#91a19b]">Collaborators update together in real time.</div></div></div><div className="mt-3 space-y-2"><Person name="You" role={canEdit ? "Can edit · active now" : "View only · active now"} initials="Y" color="#356c64" /></div></div><div className="mt-7 rounded-2xl border border-[#dfe9e4] bg-white p-4"><div className="text-[13px] font-semibold">Invite to this budget</div><p className="mt-1 text-[11px] leading-5 text-[#81938c]">Create a private link and send it to someone you trust.</p><div className="mt-4 flex items-center gap-2"><select value={inviteRole} onChange={(event) => setInviteRole(event.target.value as "editor" | "viewer")} disabled={!canEdit} className="min-w-0 flex-1 rounded-lg border border-[#d8e6df] bg-white px-2.5 py-2 text-[12px] text-[#526d65]"><option value="editor">Can edit</option><option value="viewer">View only</option></select><button onClick={createInviteLink} disabled={!canEdit} className="flex items-center gap-1.5 rounded-lg bg-[#1e5a50] px-3 py-2 text-[11px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"><Plus size={13} /> {inviteCopied ? "Copied" : "Create invite"}</button></div>{inviteMessage ? <p className="mt-3 text-[11px] leading-5 text-[#347a68]">{inviteMessage}</p> : null}</div><div className="mt-7"><div className="text-[13px] font-semibold">Backup and access</div><div className="mt-3 space-y-2"><BackupButton icon={DownloadIcon} title="Download encrypted backup" detail="Save a private copy on this computer" onClick={downloadBackup} /><BackupButton icon={Upload} title="Restore encrypted backup" detail="Upload a private copy from this computer" onClick={restoreBackup} /><BackupButton icon={FileSpreadsheet} title="Export to spreadsheet" detail="Keep an editable Excel copy" onClick={downloadSpreadsheet} /></div></div><div className="mt-7 rounded-xl border border-dashed border-[#c6dbd2] bg-[#f5faf7] p-3 text-[11px] leading-5 text-[#789089]"><KeyRound size={14} className="mb-1 text-[#4d8d7d]" /> Backups are encrypted before they leave the app. The public website contains the app, not your financial file.</div></Drawer> : null}
+      {drawer === "collab" ? <Drawer title={workspaceName} eyebrow="Budget sharing" onClose={() => setDrawer(null)}><div className="mt-6 flex items-center gap-3 rounded-2xl border border-[#cfe6db] bg-[#eff9f4] p-4"><div className="grid h-9 w-9 place-items-center rounded-full bg-[#3f9b86] text-white"><UsersRound size={17} /></div><div><div className="text-[13px] font-semibold text-[#2e6254]">Private by default</div><div className="mt-1 text-[11px] text-[#6f8d82]">Only people with an invitation can access this budget.</div></div></div>{isOwner ? <form onSubmit={renameWorkspace} className="mt-6 rounded-2xl border border-[#dfe9e4] bg-white p-4"><div className="text-[13px] font-semibold">Rename budget</div><p className="mt-1 text-[11px] text-[#81938c]">This name is shown to everyone who has access.</p><div className="mt-3 flex gap-2"><input name="budgetName" defaultValue={workspaceName} maxLength={60} className="min-w-0 flex-1 rounded-lg border border-[#d8e6df] px-2.5 py-2 text-[12px] outline-none focus:border-[#76bda8]" /><button type="submit" className="rounded-lg bg-[#1e5a50] px-3 py-2 text-[11px] font-semibold text-white">Save name</button></div>{renameMessage ? <p className="mt-2 text-[11px] text-[#347a68]">{renameMessage}</p> : null}</form> : null}<div className="mt-7"><div className="flex items-center justify-between"><div><div className="text-[13px] font-semibold">People</div><div className="mt-1 text-[11px] text-[#91a19b]">Collaborators update together in real time.</div></div></div><div className="mt-3 space-y-2"><Person name="You" role={canEdit ? "Can edit · active now" : "View only · active now"} initials="Y" color="#356c64" /></div></div><div className="mt-7 rounded-2xl border border-[#dfe9e4] bg-white p-4"><div className="text-[13px] font-semibold">Invite to this budget</div><p className="mt-1 text-[11px] leading-5 text-[#81938c]">Create a private link and send it to someone you trust.</p><div className="mt-4 flex items-center gap-2"><select value={inviteRole} onChange={(event) => setInviteRole(event.target.value as "editor" | "viewer")} disabled={!canEdit} className="min-w-0 flex-1 rounded-lg border border-[#d8e6df] bg-white px-2.5 py-2 text-[12px] text-[#526d65]"><option value="editor">Can edit</option><option value="viewer">View only</option></select><button onClick={createInviteLink} disabled={!canEdit} className="flex items-center gap-1.5 rounded-lg bg-[#1e5a50] px-3 py-2 text-[11px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"><Plus size={13} /> {inviteCopied ? "Copied" : "Create invite"}</button></div>{inviteMessage ? <p className="mt-3 text-[11px] leading-5 text-[#347a68]">{inviteMessage}</p> : null}</div><div className="mt-7"><div className="text-[13px] font-semibold">Backup and access</div><div className="mt-3 space-y-2"><BackupButton icon={DownloadIcon} title="Download encrypted backup" detail="Save a private copy on this computer" onClick={downloadBackup} /><BackupButton icon={Upload} title="Restore encrypted backup" detail="Upload a private copy from this computer" onClick={restoreBackup} /><BackupButton icon={FileSpreadsheet} title="Export to spreadsheet" detail="Keep an editable Excel copy" onClick={downloadSpreadsheet} /></div></div><div className="mt-7 rounded-xl border border-dashed border-[#c6dbd2] bg-[#f5faf7] p-3 text-[11px] leading-5 text-[#789089]"><KeyRound size={14} className="mb-1 text-[#4d8d7d]" /> Backups are encrypted before they leave the app. The public website contains the app, not your financial file.</div></Drawer> : null}
     </main>
   );
 }
@@ -600,6 +655,31 @@ function SummaryView({ included, lifetimeTotal, recurringTotal, largest, factor,
       </div>
     </>
   );
+}
+
+function DetailsView({ detailRows, annualPlan, setDetailMetric, canEdit }: { detailRows: DetailRow[]; annualPlan: AnnualPlanRow[]; setDetailMetric: (rowId: string, key: string, value: string) => void; canEdit: boolean }) {
+  const sections = [...new Set(detailRows.map((row) => row.section))];
+  const [activeSection, setActiveSection] = useState(sections[0] ?? "");
+  const selectedSection = sections.includes(activeSection) ? activeSection : sections[0] ?? "";
+  const rows = detailRows.filter((row) => row.section === selectedSection);
+  const metricKeys = [...new Set(rows.flatMap((row) => Object.keys(row.metrics)))].slice(0, 6);
+  const labelFor = (key: string) => key.replace(/([A-Z])/g, " $1").replace(/^./, (value) => value.toUpperCase());
+  const displayMetric = (key: string, value: DetailMetric) => {
+    if (value === null || value === "") return "—";
+    if (typeof value !== "number") return value;
+    if (key.toLowerCase().includes("rate") || key.toLowerCase().includes("factor")) return key.toLowerCase().includes("factor") ? value.toFixed(2) + "x" : (value * 100).toFixed(2) + "%";
+    if (key.toLowerCase().includes("year") || key.toLowerCase().includes("count") || key.toLowerCase().includes("people") || key.toLowerCase().includes("years")) return String(Math.round(value));
+    return money(value);
+  };
+  return <section className="rounded-2xl border border-[#dfe9e4] bg-white p-5 shadow-[0_8px_22px_rgba(32,62,53,0.045)] md:p-6">
+    <SectionTitle title="Workbook details" description="The original workbook’s drivers, schedules, and yearly rollups. Edit a number here and it remains part of the shared budget." />
+    {sections.length ? <div className="mb-6 flex flex-wrap gap-2">{sections.map((section) => <button key={section} onClick={() => setActiveSection(section)} className={"rounded-xl border px-3 py-2 text-[12px] font-semibold " + (selectedSection === section ? "border-[#78bba7] bg-[#eff9f4] text-[#286d5d]" : "border-[#dbe8e2] text-[#647a72]")}>{section}</button>)}</div> : null}
+    {annualPlan.length ? <div className="mb-6 rounded-2xl border border-[#dfe9e4] bg-[#f7fbf9] p-4">
+      <div className="mb-3 flex items-center justify-between"><div><div className="text-[13px] font-semibold">Year-by-year cash plan</div><div className="mt-1 text-[11px] text-[#81938c]">Income, spending, investing, and savings carried over from the workbook.</div></div><span className="text-[11px] text-[#81938c]">{annualPlan.length} years</span></div>
+      <div className="overflow-auto rounded-xl border border-[#e3ece8] bg-white"><table className="w-full min-w-[980px] text-left text-[12px]"><thead className="bg-[#f3f8f5] text-[10px] uppercase tracking-[0.1em] text-[#80948b]"><tr><th className="px-3 py-2">Year</th><th className="px-3 py-2 text-right">Income</th><th className="px-3 py-2 text-right">Living</th><th className="px-3 py-2 text-right">Cars</th><th className="px-3 py-2 text-right">Housing</th><th className="px-3 py-2 text-right">Health</th><th className="px-3 py-2 text-right">College</th><th className="px-3 py-2 text-right">Missions</th><th className="px-3 py-2 text-right">Net savings</th><th className="px-3 py-2 text-right">Accruing savings</th></tr></thead><tbody>{annualPlan.map((row) => <tr key={row.year} className="border-t border-[#edf2ef]"><td className="px-3 py-2.5 font-semibold">{row.year}</td><td className="px-3 py-2.5 text-right">{money(row.income)}</td><td className="px-3 py-2.5 text-right">{money(row.living)}</td><td className="px-3 py-2.5 text-right">{money(row.cars)}</td><td className="px-3 py-2.5 text-right">{money(row.housing)}</td><td className="px-3 py-2.5 text-right">{money(row.healthcare)}</td><td className="px-3 py-2.5 text-right">{money(row.college)}</td><td className="px-3 py-2.5 text-right">{money(row.missions)}</td><td className="px-3 py-2.5 text-right font-semibold text-[#286d5d]">{money(row.netSavings)}</td><td className="px-3 py-2.5 text-right">{money(row.accruingSavings)}</td></tr>)}</tbody></table></div>
+    </div> : null}
+    {rows.length ? <div className="overflow-auto rounded-xl border border-[#e3ece8]"><table className="w-full min-w-[920px] text-left text-[12px]"><thead className="bg-[#f3f8f5] text-[10px] uppercase tracking-[0.1em] text-[#80948b]"><tr><th className="sticky left-0 bg-[#f3f8f5] px-4 py-3">Detail</th>{metricKeys.map((key) => <th key={key} className="px-3 py-3 text-right">{labelFor(key)}</th>)}<th className="px-3 py-3">Notes</th></tr></thead><tbody>{rows.map((row) => <tr key={row.id} className="border-t border-[#edf2ef]"><td className="sticky left-0 bg-white px-4 py-3 font-medium">{row.label}</td>{metricKeys.map((key) => { const value = row.metrics[key]; return <td key={key} className="px-3 py-2 text-right">{canEdit && typeof value === "number" ? <input aria-label={row.label + " " + labelFor(key)} type="number" step={key.toLowerCase().includes("rate") ? "0.0001" : "any"} value={value} onChange={(event) => setDetailMetric(row.id, key, event.target.value)} className="w-[112px] rounded-lg border border-[#dbe8e2] bg-[#fbfdfc] px-2 py-1.5 text-right text-[12px] outline-none focus:border-[#76bda8]" /> : <span>{displayMetric(key, value)}</span>}</td>; })}<td className="max-w-[260px] px-3 py-3 text-[#81938c]">{row.notes ?? ""}</td></tr>)}</tbody></table></div> : <div className="rounded-2xl border border-dashed border-[#cbded5] bg-[#f7fbf9] p-8 text-center text-[13px] text-[#71877e]">Import the original workbook to populate this detailed planning view.</div>}
+  </section>;
 }
 
 function Metric({ label, value, note, icon: Icon, color }: { label: string; value: string; note: string; icon: React.ComponentType<{ size?: number }>; color: string }) {
